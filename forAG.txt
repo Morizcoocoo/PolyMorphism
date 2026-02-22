@@ -1,0 +1,9 @@
+Hey Gemini, running the engine.py file in debug mode shows us that no positions are being fetched, or most of them cant be fetched.
+I have assumed that it might be because i got banned from sending tooi many requests, so i set up a vpn, and got the same result. 
+TRY:
+diagnosing the problem and performing natural fixes that dont destroy the core logic, like:
+LOWERING THRESHOLDS, seeing if positions are fetched
+LOWERING AMOUNT OF REQUESTS, seeing if positions are fetched
+ADDING TESTS IN RUNTIME
+
+Examine all files and the intergration to the engine to find  a clear bug and fix it.
