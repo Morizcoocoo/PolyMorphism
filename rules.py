@@ -15,7 +15,7 @@ class HeuristicsConfig:
     
     # Entry Gate - Smoking Gun (single large bet on topic)
     SMOKING_GUN_SIZE = 1000          # was 5000
-    SMOKING_GUN_PROFIT_PCT = 30      # was 60 — easier to qualify
+    SMOKING_GUN_PROFIT_PCT = 30      # was 60   easier to qualify
 
     # Entry Gate - Heavy Hitter (systematic operator)
     HEAVY_HITTER_EXPOSURE = 3000     # was 15000
@@ -31,6 +31,18 @@ class HeuristicsConfig:
     
     # Display threshold for positions
     MIN_POSITION_FOR_DISPLAY = 500   # was 5000
+
+    # API and Flow Limits (Centralized for   1.2 Compliance)
+    SEARCH_LIMIT = 50                # Max events to fetch in Step 1
+    HOLDERS_LIMIT = 50               # Max holders per market page
+    BATCH_COOLDOWN = 5               # Seconds between batches in Step 3
+    RETRY_BASE_DELAY = 5             # Base for exponential backoff
+
+    # Holder Fetching Strategy
+    # Options: "TOP" (50), "BULK" (HOLDER_PAGES * 50), "MIXED" (TOP + 1 random page)
+    HOLDER_STRATEGY = "MIXED"
+    HOLDER_PAGES = 3                 # For BULK strategy: fetch this many pages
+    HOLDER_RANDOM_OFFSET_MAX = 500   # For MIXED strategy: pick a random offset up to this value
 
 
 class EntryGate:
@@ -63,7 +75,7 @@ class EntryGate:
             return {
                 'passed': True,
                 'entry_type': 'SMOKING_GUN',
-                'reason': f'Single bet ≥${HeuristicsConfig.SMOKING_GUN_SIZE:,}'
+                'reason': f'Single bet  ${HeuristicsConfig.SMOKING_GUN_SIZE:,}'
             }
         
         # PATH 2: Heavy Hitter - Systematic operator
@@ -242,16 +254,16 @@ class QualificationFilters:
         Check if whale passes qualification filters.
 
         Two-path logic:
-          - Has closed positions → enforce ALL filters (topic count, exposure,
+          - Has closed positions   enforce ALL filters (topic count, exposure,
             concentration, historical trades, profit factor, ROI)
-          - Active-only (no closed history) → enforce only structural filters
+          - Active-only (no closed history)   enforce only structural filters
             (topic count, exposure, concentration). Skipping performance metrics
             avoids incorrectly rejecting PURE ACTIVE whales who have never
             closed a position in our fetched window.
 
         BUG FIX: Previously all 6 checks ran unconditionally, meaning any whale
         with zero closed positions had profit_factor=0, roi=0, historical=0 and
-        was guaranteed to fail — even if they had a $10k active position.
+        was guaranteed to fail   even if they had a $10k active position.
         
         Args:
             metrics: Calculated metrics
@@ -259,23 +271,24 @@ class QualificationFilters:
         Returns:
             (passed: bool, reason: str)
         """
-        # ── Always-required structural checks ──────────────────────────────
+        #   Always-required structural checks  
+        # NOTE: Concentration is intentionally NOT a hard gate here.
+        # It is used as a CLASSIFICATION signal in WhaleClassifier instead.
+        # A diversified whale who bets $1M on topic AND $10M on other markets
+        # is still worth investigating   hard concentration gates caused false negatives.
         structural_checks = [
             (metrics['topic_positions'] >= HeuristicsConfig.MIN_ONTOPIC_POSITIONS,
              f"Topic positions: {metrics['topic_positions']} < {HeuristicsConfig.MIN_ONTOPIC_POSITIONS}"),
             
             (metrics['total_exposure'] >= HeuristicsConfig.MIN_TOTAL_EXPOSURE,
              f"Total exposure: ${metrics['total_exposure']:,.0f} < ${HeuristicsConfig.MIN_TOTAL_EXPOSURE:,}"),
-            
-            (metrics['concentration'] >= HeuristicsConfig.MIN_CONCENTRATION,
-             f"Concentration: {metrics['concentration']:.1f}% < {HeuristicsConfig.MIN_CONCENTRATION}%"),
         ]
         
         for passed, reason in structural_checks:
             if not passed:
                 return False, reason
         
-        # ── Performance checks only when closed history exists ─────────────
+        #   Performance checks only when closed history exists  
         if metrics['historical_total'] > 0:
             perf_checks = [
                 (metrics['historical_total'] >= HeuristicsConfig.MIN_HISTORICAL_TRADES,
@@ -320,7 +333,7 @@ class WhaleClassifier:
         win_delta = win_rates['win_rate_delta']
         is_specialist = win_rates['is_topic_specialist']
         
-        # 💀 TIER 0: EXTREME OUTLIER
+        #   TIER 0: EXTREME OUTLIER
         if all([
             pf > 10.0,
             conc > 80,
@@ -332,13 +345,13 @@ class WhaleClassifier:
         ]):
             return {
                 'tier': 'EXTREME_OUTLIER',
-                'flag': '💀 EXTREME OUTLIER - INVESTIGATE IMMEDIATELY',
+                'flag': 'EXTREME OUTLIER - INVESTIGATE IMMEDIATELY',
                 'priority': 10,
-                'reasoning': f'PF={pf:.1f}, Win Δ={win_delta:+.1f}%, ${pnl:,.0f} profit',
+                'reasoning': f'PF={pf:.1f}, Win Delta={win_delta:+.1f}%, ${pnl:,.0f} profit',
                 'insider_probability': 95
             }
         
-        # 🚨 TIER 1: SUPER HIGH
+        #   TIER 1: SUPER HIGH
         elif all([
             pf > 3.5,
             conc > 70,
@@ -351,13 +364,13 @@ class WhaleClassifier:
         ]):
             return {
                 'tier': 'SUPER_HIGH',
-                'flag': '🚨 PROBABLE INSIDER',
+                'flag': 'PROBABLE INSIDER',
                 'priority': 5,
-                'reasoning': f'PF={pf:.1f}, Win Δ={win_delta:+.1f}%, Conc={conc:.0f}%',
+                'reasoning': f'PF={pf:.1f}, Win Delta={win_delta:+.1f}%, Conc={conc:.0f}%',
                 'insider_probability': 80
             }
         
-        # ⭐ TIER 2: HIGH
+        #   TIER 2: HIGH
         elif all([
             pf > 2.5,
             conc > 60,
@@ -370,13 +383,13 @@ class WhaleClassifier:
         ]):
             return {
                 'tier': 'HIGH',
-                'flag': '⭐ STRONG INFORMATION EDGE',
+                'flag': 'STRONG INFORMATION EDGE',
                 'priority': 4,
-                'reasoning': f'PF={pf:.1f}, Win Δ={win_delta:+.1f}%',
+                'reasoning': f'PF={pf:.1f}, Win Delta={win_delta:+.1f}%',
                 'insider_probability': 60
             }
         
-        # ✅ TIER 3: MEDIUM
+        # [OK] TIER 3: MEDIUM
         elif all([
             pf > 2.0,
             conc > 50,
@@ -388,13 +401,13 @@ class WhaleClassifier:
         ]):
             return {
                 'tier': 'MEDIUM',
-                'flag': '✅ SKILLED OPERATOR',
+                'flag': 'SKILLED OPERATOR',
                 'priority': 3,
                 'reasoning': f'PF={pf:.1f}, {trades} bets, ${pnl:,.0f}',
                 'insider_probability': 40
             }
         
-        # 📊 TIER 4: WATCH LIST
+        # [STATS] TIER 4: WATCH LIST
         elif all([
             pf > 1.5,
             conc > 40,
@@ -404,17 +417,17 @@ class WhaleClassifier:
         ]):
             return {
                 'tier': 'WATCH',
-                'flag': '📊 WATCH LIST - Emerging Pattern',
+                'flag': 'WATCH LIST - Emerging Pattern',
                 'priority': 2,
                 'reasoning': f'{trades} bets, needs more data',
                 'insider_probability': 20
             }
         
-        # ⚠️ TIER 5: MARGINAL
+        # [WARN] TIER 5: MARGINAL
         else:
             return {
                 'tier': 'MARGINAL',
-                'flag': '⚠️ MARGINAL',
+                'flag': 'MARGINAL',
                 'priority': 1,
                 'reasoning': 'Weak signals',
                 'insider_probability': 5

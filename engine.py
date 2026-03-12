@@ -4,6 +4,7 @@ Main orchestration - runs the complete OSINT mission
 """
 
 import asyncio
+import random
 import pandas as pd
 from datetime import datetime
 from typing import Dict, List
@@ -17,119 +18,131 @@ from rules import (
 
 class PolymarketOSINTEngine:
        
-    def __init__(self, query_string: str, debug: bool = True):  # ✅ Add debug flag
+    def __init__(self, query_string: str, use_regex: bool = False, debug: bool = True):  # [OK] Add use_regex flag
         """
         Initialize the engine
         
         Args:
             query_string: User's search query
+            use_regex: Enable regex-based matching
             debug: Enable verbose logging
         """
-        self.query_config = QueryParser.parse(query_string)
-        self.matcher = QueryMatcher(self.query_config)
+        self.query_root = QueryParser.parse(query_string)
+        self.matcher = QueryMatcher(self.query_root, query_string, use_regex=use_regex)
         self.registry: Dict[str, Dict] = {}
-        self.debug = debug  # ✅ Store debug flag
+        self.known_event_slugs: set = set()  # Slugs of events matched in Step 1 (used for position matching)
+        self.debug = debug
         
-        print(f"🎯 Query: {self.matcher.get_display_query()}")
-        print(f"   Type: {self.query_config['type']}")
+        print(f"[QUERY] {self.matcher.get_display_query()}")
     
     async def run_mission(self):
         """Execute the complete OSINT mission with timeout"""
         print("\n" + "="*60)
-        print("🚀 POLYMARKET OSINT MISSION - INSIDER WHALE DETECTION")
+        print("MISSION: POLYMARKET OSINT MISSION - INSIDER WHALE DETECTION")
         print("="*60 + "\n")
         
         try:
-            # ✅ Add overall timeout (10 minutes max)
-            await asyncio.wait_for(self._run_mission_internal(), timeout=3600)  # BUG FIX: was 600s (10min) — far too short for large runs
+            # [OK] Add overall timeout (10 minutes max)
+            await asyncio.wait_for(self._run_mission_internal(), timeout=3600)  # BUG FIX: was 600s (10min)   far too short for large runs
         except asyncio.TimeoutError:
-            print("\n⚠️  MISSION TIMEOUT (10 minutes exceeded)")
+            print("\n[TIMEOUT] MISSION TIMEOUT (10 minutes exceeded)")
             print("   Partial results may be available")
             self._export_partial_results()
         except KeyboardInterrupt:
-            print("\n\n⚠️  MISSION INTERRUPTED BY USER")
+            print("\n\n[STOP] MISSION INTERRUPTED BY USER")
             print("   Attempting to save partial results...")
             self._export_partial_results()
         except Exception as e:
-            print(f"\n❌ MISSION FAILED: {e}")
+            print(f"\n[ERROR] MISSION FAILED: {e}")
             raise
 
     async def _run_mission_internal(self):
         """Internal mission execution (original run_mission logic)"""
         async with PolymarketAPI() as api:
             # Step 1: Search for events
-            print("📍 Step 1: Searching for events...")
+            print("[1] Searching for events...")
             events = await self._search_events(api)
             
             if not events:
-                print("❌ No events found matching query")
+                print("[ERROR] No events found matching query")
                 return
             
-            print(f"✅ Found {len(events)} matching events\n")
+            print(f"[OK] Found {len(events)} matching events\n")
             
             # Step 2: Extract markets and holders
-            print("📍 Step 2: Collecting market holders...")
+            print("[2] Collecting market holders...")
             await self._collect_holders(api, events)
             
             if not self.registry:
-                print("❌ No holders found")
+                print("[ERROR] No holders found")
                 return
             
-            print(f"✅ Found {len(self.registry)} unique whales\n")
+            print(f"[OK] Found {len(self.registry)} unique whales\n")
             
             # Step 3: Fetch all positions
-            print("📍 Step 3: Fetching whale positions...")
+            print("[3] Fetching whale positions...")
             await self._fetch_all_positions(api)
             print()
             
             # Step 4: Analyze and classify
-            print("📍 Step 4: Analyzing and classifying whales...")
+            print("[4] Analyzing and classifying whales...")
             results = self._analyze_whales()
             
             # Step 5: Export to Excel
-            print("\n📍 Step 5: Exporting results...")
+            print("\n[5] Exporting results...")
             self._export_to_excel(results)
             
             print("\n" + "="*60)
-            print("✅ MISSION COMPLETE")
+            print("[DONE] MISSION COMPLETE")
             print("="*60)
 
     def _export_partial_results(self):
         """Export whatever data we have so far"""
-        print("📊 Attempting to export partial results...")
+        print("[INFO] Attempting to export partial results...")
         try:
             results = self._analyze_whales()
             self._export_to_excel(results)
         except Exception as e:
-            print(f"❌ Could not export partial results: {e}")
+            print(f"[ERROR] Could not export partial results: {e}")
     
     async def _search_events(self, api: PolymarketAPI) -> List[Dict]:
         """Search for events matching query"""
         
-        # Strategy: Search API with first term (wider results)
-        # Then filter client-side with full match logic (precision)
-        search_term = self.query_config['terms'][0]
+        # Strategy: Search API with first available term (wider results)
+        # Then filter client-side with full Boolean match logic (precision)
         
-        print(f"   🔍 Searching Polymarket API: '{search_term}'")
-        all_events = await api.search_events(search_term, limit=20)
+        # We need a first term to search Polymarket API
+        def _get_first_term(node):
+            if hasattr(node, 'term'): return node.term
+            if hasattr(node, 'left'): return _get_first_term(node.left)
+            return "polymarket" # fallback
+            
+        search_term = _get_first_term(self.query_root)
+        
+        print(f"   [SEARCH] Searching Polymarket API: '{search_term}' (Limit: {HeuristicsConfig.SEARCH_LIMIT})")
+        all_events = await api.search_events(search_term, limit=HeuristicsConfig.SEARCH_LIMIT)
         
         if not all_events:
-            print(f"   ⚠️  No events found for '{search_term}'")
+            print(f"   [WARN] No events found for '{search_term}'")
             return []
         
-        print(f"   📥 API returned: {len(all_events)} events")
+        print(f"   [DATA] API returned: {len(all_events)} events")
         
         # Filter by full query logic
         matching_events = []
         for event in all_events:
             title = event.get('title', '')
+            slug  = event.get('slug', '')
             if self.matcher.matches(title):
                 matching_events.append(event)
-                print(f"      ✅ Match: {title}")
+                if slug:
+                    self.known_event_slugs.add(slug)  # [OK] Track matched event slugs for position matching
+                print(f"      [MATCH] Match: {title}")
             else:
-                print(f"      ❌ Skip: {title}")
+                print(f"      [SKIP] Skip: {title}")
         
-        print(f"   🎯 After filtering: {len(matching_events)} matching events")
+        print(f"   [DONE] After filtering: {len(matching_events)} matching events")
+        print(f"   [INFO] Known event slugs: {len(self.known_event_slugs)}")
         
         return matching_events
     
@@ -142,7 +155,7 @@ class PolymarketOSINTEngine:
         2. For each matched event, get holders from ALL its markets
         3. Position filtering happens later in _process_whale_positions()
         """
-        print(f"   🎯 Collecting holders from {len(events)} matched events...")
+        print(f"   [INFO] Collecting holders from {len(events)} matched events...")
         
         tasks = []
         for event in events:
@@ -152,31 +165,31 @@ class PolymarketOSINTEngine:
         
         await asyncio.gather(*tasks)
         
-        print(f"\n   📊 Total unique whales in registry: {len(self.registry)}")
+        print(f"\n   [STATS] Total unique whales in registry: {len(self.registry)}")
 
     async def _process_event(self, api: PolymarketAPI, slug: str):
         """
         Process a single event and collect holders from ALL its markets
         
-        Logic: If EVENT matches query → Get holders from ALL markets in that event
+        Logic: If EVENT matches query   Get holders from ALL markets in that event
         """
         event_details = await api.get_event_details(slug)
         
         if not event_details:
-            print(f"      ⚠️  Could not fetch details for slug: {slug}")
+            print(f"      [WARN]  Could not fetch details for slug: {slug}")
             return
         
         event_title = event_details.get('title', 'Unknown')
         markets = event_details.get('markets', [])
         
-        # ✅ Event already matched in _search_events(), 
+        # [OK] Event already matched in _search_events(), 
         # so get holders from ALL markets in this event
         
         if not markets:
-            print(f"      ⚠️  No markets in event: {event_title}")
+            print(f"      [WARN]  No markets in event: {event_title}")
             return
         
-        print(f"   📋 Processing event: {event_title}")
+        print(f"   [LIST] Processing event: {event_title}")
         print(f"      Markets in event: {len(markets)}")
         
         total_holders_collected = 0
@@ -186,41 +199,59 @@ class PolymarketOSINTEngine:
             condition_id = market.get('conditionId')
             
             if not condition_id:
-                print(f"      ⚠️  Market {idx} missing condition ID: {question[:50]}...")
+                print(f"      [WARN]  Market {idx} missing condition ID: {question[:50]}...")
                 continue
             
-            # ✅ Get holders from EVERY market (no filtering)
-            holders = await api.get_market_holders(condition_id, limit=50)
+            # --- Holder Search Strategy (Implemented per   2.2 and   3.1) ---
+            strategy = HeuristicsConfig.HOLDER_STRATEGY
+            holders_to_fetch = []
             
-            if not holders:
-                continue
+            if strategy == "TOP":
+                # Only fetch the first page (top holders)
+                holders_to_fetch.append(api.get_market_holders(condition_id, limit=HeuristicsConfig.HOLDERS_LIMIT, offset=0))
             
-            print(f"      📊 Market {idx}/{len(markets)}: {len(holders)} holders")
-            print(f"         Question: {question[:60]}...")
+            elif strategy == "BULK":
+                # Fetch N pages sequentially
+                for page in range(HeuristicsConfig.HOLDER_PAGES):
+                    holders_to_fetch.append(api.get_market_holders(condition_id, limit=HeuristicsConfig.HOLDERS_LIMIT, offset=page * HeuristicsConfig.HOLDERS_LIMIT))
             
-            # Register all holders
-            for holder in holders:
-                wallet = holder.get('proxyWallet')
-                name = holder.get('name', wallet[:8] if wallet else 'Unknown')
+            elif strategy == "MIXED":
+                # TOP page + 1 Random page from deeper offset
+                holders_to_fetch.append(api.get_market_holders(condition_id, limit=HeuristicsConfig.HOLDERS_LIMIT, offset=0))
+                random_offset = random.randint(HeuristicsConfig.HOLDERS_LIMIT, HeuristicsConfig.HOLDER_RANDOM_OFFSET_MAX)
+                holders_to_fetch.append(api.get_market_holders(condition_id, limit=HeuristicsConfig.HOLDERS_LIMIT, offset=random_offset))
+            
+            print(f"      [STATS] Market {idx}/{len(markets)}: Fetching holders using strategy '{strategy}'...")
+            
+            # Execute fetch tasks
+            pages_results = await asyncio.gather(*holders_to_fetch)
+            
+            # Register all unique holders across all fetched pages
+            for page_holders in pages_results:
+                if not page_holders: continue
                 
-                if wallet and wallet not in self.registry:
-                    self.registry[wallet] = {
-                        'name': name,
-                        'wallet': wallet,
-                        'positions_fetched': False
-                    }
-                    total_holders_collected += 1
+                for holder in page_holders:
+                    wallet = holder.get('proxyWallet')
+                    name = holder.get('name', wallet[:8] if wallet else 'Unknown')
+                    
+                    if wallet and wallet not in self.registry:
+                        self.registry[wallet] = {
+                            'name': name,
+                            'wallet': wallet,
+                            'positions_fetched': False
+                        }
+                        total_holders_collected += 1
         
-        print(f"   ✅ Collected {total_holders_collected} unique new holders from this event\n")
+        print(f"   [OK] Collected {total_holders_collected} unique new holders from this event\n")
         
     async def _fetch_all_positions(self, api: PolymarketAPI):
         """Fetch positions for whales in batches, prioritizing top holders"""
         
         total = len(self.registry)
         
-        # ✅ Ask user how many to process
+        # [OK] Ask user how many to process
         if total > 500:
-            print(f"\n⚠️  WARNING: {total} whales found!")
+            print(f"\n[WARN] WARNING: {total} whales found!")
             print(f"   Fetching all would take ~{(total * 4) / 60:.0f} minutes")
             
             max_whales = input(f"\n   How many whales to analyze? (1-{total}, default=200): ").strip()
@@ -231,7 +262,7 @@ class PolymarketOSINTEngine:
             except:
                 max_whales = 200
             
-            print(f"   🎯 Processing top {max_whales} whales only")
+            print(f"   [INFO] Processing top {max_whales} whales only")
             
             # Limit registry to first N whales
             registry_items = list(self.registry.items())[:max_whales]
@@ -239,9 +270,9 @@ class PolymarketOSINTEngine:
             registry_items = list(self.registry.items())
             max_whales = total
         
-        print(f"   🎯 Fetching positions for {max_whales} whales...")
-        print(f"   ⏱️  Estimated time: ~{(max_whales * 4) / 60:.0f} minutes")
-        print(f"   ⏱️  Rate limit: {api.REQUEST_DELAY}s delay, {api.MAX_CONCURRENT_REQUESTS} concurrent\n")
+        print(f"   [INFO] Fetching positions for {max_whales} whales...")
+        print(f"   [TIME] Estimated time: ~{(max_whales * 4) / 60:.0f} minutes")
+        print(f"   [TIME] Rate limit: {api.REQUEST_DELAY}s delay, {api.MAX_CONCURRENT_REQUESTS} concurrent\n")
         
         # Process in batches (keep small to match MAX_CONCURRENT_REQUESTS)
         BATCH_SIZE = 10
@@ -250,7 +281,7 @@ class PolymarketOSINTEngine:
             batch = registry_items[batch_num:batch_num + BATCH_SIZE]
             batch_end = min(batch_num + BATCH_SIZE, len(registry_items))
             
-            print(f"   📦 Batch {batch_num//BATCH_SIZE + 1}/{(len(registry_items) + BATCH_SIZE - 1)//BATCH_SIZE}")
+            print(f"   [BATCH] Batch {batch_num//BATCH_SIZE + 1}/{(len(registry_items) + BATCH_SIZE - 1)//BATCH_SIZE}")
             print(f"      Whales {batch_num + 1}-{batch_end}")
             
             tasks = []
@@ -271,20 +302,20 @@ class PolymarketOSINTEngine:
                     if result['active'] or result['closed']:
                         success_count += 1
             
-            print(f"      ✅ Fetched: {success_count}/{len(batch)}\n")
+            print(f"      [OK] Fetched: {success_count}/{len(batch)}\n")
             
-            # Brief pause between batches — semaphore + REQUEST_DELAY already throttles per-request
+            # Brief pause between batches   semaphore + REQUEST_DELAY already throttles per-request
             # BUG FIX: was 30s, which caused 10-min timeout to fire after only ~14 batches (~140 whales)
             if batch_end < len(registry_items):
-                print(f"      ⏸️  Brief cooldown 5s before next batch...")
-                await asyncio.sleep(5)
+                print(f"      [PAUSE] Batch cooldown {HeuristicsConfig.BATCH_COOLDOWN}s...")
+                await asyncio.sleep(HeuristicsConfig.BATCH_COOLDOWN)
         
         # Final summary
         total_fetched = sum(1 for info in self.registry.values() 
                         if info.get('positions_fetched') and 
                         (info.get('active_raw') or info.get('closed_raw')))
         
-        print(f"\n   ✅ Successfully fetched: {total_fetched}/{max_whales} whales")
+        print(f"\n   [OK] Successfully fetched: {total_fetched}/{max_whales} whales")
             
 
     def _analyze_whales(self) -> Dict:
@@ -293,9 +324,9 @@ class PolymarketOSINTEngine:
         active_positions = []
         closed_positions = []
         
-        print(f"\n🔬 DEBUG: Analyzing {len(self.registry)} whales...")
+        print(f"\n[DEBUG] DEBUG: Analyzing {len(self.registry)} whales...")
         
-        # ✅ Diagnostic counters
+        # [OK] Diagnostic counters
         debug_stats = {
             'total_whales': len(self.registry),
             'positions_fetched': 0,
@@ -311,29 +342,29 @@ class PolymarketOSINTEngine:
             
             if self.debug:
                 print(f"\n{'='*60}")
-                print(f"🐋 Whale {idx}/{len(self.registry)}: {whale_name}")
+                print(f"[WHALE] Whale {idx}/{len(self.registry)}: {whale_name}")
                 print(f"   Wallet: {wallet[:10]}...")
             
             # Check if positions were fetched
             if not info.get('positions_fetched'):
                 if self.debug:
-                    print(f"   ❌ Positions not fetched (rate limited or error)")
+                    print(f"   [ERROR] Positions not fetched (rate limited or error)")
                 continue
             
             debug_stats['positions_fetched'] += 1
             
-            # ✅ Print raw data sample
+            # [OK] Print raw data sample
             if self.debug:
                 active_count = len(info.get('active_raw', []))
                 closed_count = len(info.get('closed_raw', []))
-                print(f"   📦 Raw data: {active_count} active, {closed_count} closed positions")
+                print(f"   [BATCH] Raw data: {active_count} active, {closed_count} closed positions")
             
             # Process positions
             whale_data = self._process_whale_positions(info)
             
-            # ✅ Print processed data
+            # [OK] Print processed data
             if self.debug:
-                print(f"   📊 Processed data:")
+                print(f"   [STATS] Processed data:")
                 print(f"      - All positions: {len(whale_data['all_positions'])}")
                 print(f"      - Topic positions: {len(whale_data['all_topic_positions'])}")
                 print(f"      - Closed topic: {len(whale_data['closed_topic_positions'])}")
@@ -343,7 +374,7 @@ class PolymarketOSINTEngine:
             entry_result = EntryGate.evaluate(whale_data)
             
             if self.debug:
-                print(f"   🚪 Entry Gate: {'✅ PASSED' if entry_result['passed'] else '❌ FAILED'}")
+                print(f"   [DOOR] Entry Gate: {'[OK] PASSED' if entry_result['passed'] else '[ERROR] FAILED'}")
                 print(f"      Type: {entry_result['entry_type']}")
                 print(f"      Reason: {entry_result['reason']}")
             
@@ -357,9 +388,9 @@ class PolymarketOSINTEngine:
             metrics = MetricsCalculator.calculate(whale_data)
             win_rates = WinRateAnalyzer.analyze(whale_data)
             
-            # ✅ Print metrics
+            # [INFO] Print metrics
             if self.debug:
-                print(f"   📈 Metrics:")
+                print(f"   [METRICS] Metrics:")
                 print(f"      - Profit Factor: {metrics['profit_factor']:.2f}")
                 print(f"      - ROI: {metrics['roi']:.1f}%")
                 print(f"      - Concentration: {metrics['concentration']:.1f}%")
@@ -372,7 +403,7 @@ class PolymarketOSINTEngine:
             passed_qual, qual_reason = QualificationFilters.passes(metrics)
             
             if self.debug:
-                print(f"   🎓 Qualification: {'✅ PASSED' if passed_qual else '❌ FAILED'}")
+                print(f"   [GRAD] Qualification: {'[OK] PASSED' if passed_qual else '[ERROR] FAILED'}")
                 if not passed_qual:
                     print(f"      Reason: {qual_reason}")
             
@@ -387,7 +418,7 @@ class PolymarketOSINTEngine:
             classification = WhaleClassifier.classify(metrics, win_rates)
             
             if self.debug:
-                print(f"   🏆 Classification: {classification['flag']}")
+                print(f"   [CROWN] Classification: {classification['flag']}")
                 print(f"      Tier: {classification['tier']}")
                 print(f"      Priority: {classification['priority']}")
                 print(f"      Insider Prob: {classification['insider_probability']}%")
@@ -409,7 +440,7 @@ class PolymarketOSINTEngine:
                 'Overall_Win_Rate': win_rates['overall_win_rate'],
                 'Topic_Win_Rate': win_rates['topic_win_rate'],
                 'Win_Rate_Delta': win_rates['win_rate_delta'],
-                'Topic_Specialist': '✅ YES' if win_rates['is_topic_specialist'] else 'No',
+                'Topic_Specialist': 'YES' if win_rates['is_topic_specialist'] else 'No',
                 'Topic_Bets': metrics['topic_positions'],
                 'Total_Historical_Bets': win_rates['overall_total'],
                 'Concentration': metrics['concentration'],
@@ -440,15 +471,15 @@ class PolymarketOSINTEngine:
                     'Profit_Pct': pos['profit_pct']
                 })
         
-        # ✅ Print debug summary
+        # Final debug summary
         print(f"\n{'='*60}")
-        print(f"📊 DEBUG SUMMARY")
+        print(f"DEBUG SUMMARY")
         print(f"{'='*60}")
         print(f"Total whales in registry: {debug_stats['total_whales']}")
         print(f"Positions successfully fetched: {debug_stats['positions_fetched']}")
         print(f"Failed entry gate: {debug_stats['failed_entry_gate']}")
         print(f"Failed qualification: {debug_stats['failed_qualification']}")
-        print(f"✅ PASSED ALL FILTERS: {debug_stats['passed_all_filters']}")
+        print(f"   [OK] PASSED ALL FILTERS: {debug_stats['passed_all_filters']}")
         
         if debug_stats['entry_gate_reasons']:
             print(f"\nEntry Gate Failure Reasons:")
@@ -471,15 +502,33 @@ class PolymarketOSINTEngine:
             'closed': closed_positions
         }
     
+    def _is_topic_position(self, title: str, event_slug: str) -> bool:
+        """
+        Determine if a position is on-topic via TWO paths:
+          1. Title text match (query keywords in market title)
+          2. EventSlug match (position belongs to an event we already identified as on-topic)
+        
+        Path 2 is the reliable fallback: even if the market title like
+        'By March 31?' doesn't contain 'iran', if its eventSlug is
+        'will-iran-strike-israel-by-march-31' then it IS on topic.
+        """
+        # Path 1: Title text match
+        if self.matcher.matches(title):
+            return True
+        # Path 2: EventSlug membership check
+        if event_slug and event_slug in self.known_event_slugs:
+            return True
+        return False
+
     def _process_whale_positions(self, info: Dict) -> Dict:
         """Process raw positions into structured data"""
 
         active_raw = info.get('active_raw', [])
         closed_raw = info.get('closed_raw', [])
         
-        # ✅ DEBUG: Print first position sample
+        # [OK] DEBUG: Print first position sample
         if self.debug and (active_raw or closed_raw):
-            print(f"\n   🔬 RAW DATA SAMPLE:")
+            print(f"\n   [DEBUG] RAW DATA SAMPLE:")
             if active_raw:
                 sample = active_raw[0]
                 print(f"      Active position fields: {list(sample.keys())}")
@@ -507,7 +556,8 @@ class PolymarketOSINTEngine:
             pos_data = {'spent': spent, 'raw': ab}
             all_active.append(pos_data)
             
-            if self.matcher.matches(market_title):
+            event_slug = ab.get('eventSlug', '')
+            if self._is_topic_position(market_title, event_slug):
                 topic_active.append(pos_data)
                 
                 if spent >= HeuristicsConfig.MIN_POSITION_FOR_DISPLAY:
@@ -548,7 +598,8 @@ class PolymarketOSINTEngine:
             
             all_closed.append(pos_data)
             
-            if self.matcher.matches(market_title):
+            event_slug = cb.get('eventSlug', '')
+            if self._is_topic_position(market_title, event_slug):
                 topic_closed.append(pos_data)
                 
                 if cost >= HeuristicsConfig.MIN_POSITION_FOR_DISPLAY:
@@ -568,16 +619,16 @@ class PolymarketOSINTEngine:
     def _export_to_excel(self, results: Dict):
         """Export results to Excel"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        query_clean = self.query_config['raw'].replace(' ', '_').replace(',', '')
+        query_clean = self.matcher.raw.replace(' ', '_').replace(',', '')
         filename = f"OSINT_INSIDER_REPORT_{query_clean}_{timestamp}.xlsx"
         
-        # ✅ Check if we have any data to export
+        # [OK] Check if we have any data to export
         has_expertise = len(results['expertise']) > 0
         has_active = len(results['active']) > 0
         has_closed = len(results['closed']) > 0
         
         if not (has_expertise or has_active or has_closed):
-            print("\n⚠️  WARNING: No data to export!")
+            print("\n[WARN] WARNING: No data to export!")
             print("   Possible reasons:")
             print("   - All whales were rate limited (429 errors)")
             print("   - No whales passed entry gate filters")
@@ -601,20 +652,20 @@ class PolymarketOSINTEngine:
                     df_closed = pd.DataFrame(results['closed'])
                     df_closed.to_excel(writer, sheet_name='Closed_Positions', index=False)
                 
-                # ✅ If no sheets created, add placeholder
+                # [OK] If no sheets created, add placeholder
                 if not (has_expertise or has_active or has_closed):
                     df_placeholder = pd.DataFrame({
                         'Message': ['No data available - see console for details']
                     })
                     df_placeholder.to_excel(writer, sheet_name='No_Data', index=False)
             
-            print(f"\n📊 Report saved: {filename}")
+            print(f"\n[OK] Report saved: {filename}")
             print(f"   Whales identified: {len(results['expertise'])}")
             print(f"   Active positions: {len(results['active'])}")
             print(f"   Closed positions: {len(results['closed'])}")
             
         except Exception as e:
-            print(f"\n❌ Error creating Excel file: {e}")
+            print(f"\n[ERROR] Error creating Excel file: {e}")
 
 
 # --- Main Execution ---
@@ -622,9 +673,9 @@ import sys
 
 async def main():
     """Main entry point"""
-    print("\n🐋 POLYMARKET INSIDER WHALE DETECTOR")
+    print("\n[WHALE] POLYMARKET INSIDER WHALE DETECTOR")
     print("=" * 60)
-     # ✅ Windows: Prevent sleep during execution
+     # [OK] Windows: Prevent sleep during execution
     if sys.platform == 'win32':
         try:
             import ctypes
@@ -633,30 +684,33 @@ async def main():
             ctypes.windll.kernel32.SetThreadExecutionState(
                 ES_CONTINUOUS | ES_SYSTEM_REQUIRED
             )
-            print("🔒 Sleep mode disabled during execution")
+            print("[LOCK] Sleep mode disabled during execution")
         except:
-            print("⚠️  Could not disable sleep mode - keep PC awake manually!")
+            print("[WARN] Could not disable sleep mode - keep PC awake manually!")
 
     user_query = input("\nEnter your query: ").strip()
     
     if not user_query:
-        print("❌ Query cannot be empty")
+        print("[ERROR] Query cannot be empty")
         return
     
     debug_mode = input("Enable debug mode? (y/n, default=y): ").strip().lower()
     debug = debug_mode != 'n'
     
+    use_regex_input = input("USE REGEX? (y/n, default=n): ").strip().lower()
+    use_regex = use_regex_input == 'y'
+    
     # --- STARTUP CONNECTIVITY TEST ---
-    print("\n🔌 Testing API connectivity...")
+    print("\n[CONN] Testing API connectivity...")
     async with PolymarketAPI() as test_api:
         test_result = await test_api.search_events("bitcoin", limit=1)
         if test_result:
-            print(f"   ✅ API reachable — got {len(test_result)} result(s)")
+            print(f"   [OK] API reachable   got {len(test_result)} result(s)")
         else:
-            print("   ⚠️  API returned no results for 'bitcoin' — check connection or VPN")
+            print("   [WARN] API returned no results for 'bitcoin'   check connection or VPN")
             print("   Proceeding anyway...")
     
-    engine = PolymarketOSINTEngine(user_query, debug=debug)  # FIX: pass debug flag
+    engine = PolymarketOSINTEngine(user_query, use_regex=use_regex, debug=debug)
     await engine.run_mission()
 
 
